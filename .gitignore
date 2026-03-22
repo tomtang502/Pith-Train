@@ -1,0 +1,69 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+wheels/
+pip-wheel-metadata/
+MANIFEST
+
+# Virtual environments.
+.venv
+uv.lock
+/install.sh
+/venv_cmd.sh
+
+# IDEs and editors
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Type checkers / linters
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Profiling / logs
+*.log
+*.nsys-rep
+*.sqlite
+*.qdrep
+/temp.txt
+/slurm-*.out
+
+# OS files
+.DS_Store
+Thumbs.db
+/.nfs*
+
+# Secrets / environment
+.env
+.env.*
+
+# Workspace directory.
+debug
+workspace
+wandb

@@ -1,0 +1,75 @@
+[project]
+name = "pithtrain"
+version = "0.1.0"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "deep-gemm",
+    "flash-attn",
+    "tilelang",
+    "torch>=2.10.0",
+    "transformers",
+    "wandb",
+    "zstandard",
+]
+
+[dependency-groups]
+dev = ["pre-commit", "pytest", "ruff"]
+
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools>=61"]
+
+[tool.setuptools.packages.find]
+include = ["pithtrain*"]
+
+[tool.uv]
+
+[[tool.uv.index]]
+name = "torch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+deep-gemm = { git = "https://github.com/deepseek-ai/DeepGEMM", branch = "main" }
+torch = { index = "torch-cu130" }
+
+[tool.uv.extra-build-dependencies]
+deep-gemm = [
+    "torch>=2.10.0",
+    "packaging",
+    "setuptools",
+    "wheel",
+]
+flash-attn = [
+    { requirement = "torch", match-runtime = true },
+    "ninja",
+    "packaging",
+    "psutil",
+    "wheel",
+]
+
+[tool.uv.extra-build-variables]
+deep-gemm = { DG_FORCE_BUILD = "1", DG_USE_LOCAL_VERSION = "0" }
+flash-attn = { FLASH_ATTENTION_FORCE_BUILD = "TRUE", FLASH_ATTN_CUDA_ARCHS = "90;100" }
+
+[tool.mypy]
+follow_imports = "skip"
+ignore_errors = false
+ignore_missing_imports = true
+show_column_numbers = true
+show_error_context = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.ruff.lint]
+ignore = ["E501", "E731"]
+select = ["E", "F", "I", "W"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pithtrain"]

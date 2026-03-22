@@ -1,0 +1,28 @@
+repos:
+  # Basic file hygiene
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-ast            # pycompile / syntax check — extremely fast
+      - id: check-added-large-files
+      - id: check-merge-conflict
+
+  # Ruff: linting + formatting (replaces black + pylint + isort)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.0
+    hooks:
+      - id: ruff                 # linter
+        args: [--fix]
+      - id: ruff-format          # formatter
+
+  # Type checking — disabled for now due to 297 pre-existing errors.
+  # Enable once type annotations are cleaned up across the codebase.
+  # - repo: https://github.com/pre-commit/mirrors-mypy
+  #   rev: v1.15.0
+  #   hooks:
+  #     - id: mypy
+  #       additional_dependencies: []   # add stubs here if needed
+  #       args: [--ignore-missing-imports, --explicit-package-bases]
