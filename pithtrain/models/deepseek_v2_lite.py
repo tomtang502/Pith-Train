@@ -29,8 +29,9 @@ from pithtrain.layers.factory import (
 from pithtrain.models.interface import ForwardAttnOutput
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
-from pithtrain.operators.mla import MLA
+from pithtrain.operators.flash_attn_v4 import mla_flash_attn_func
 from pithtrain.operators.token_scatter import precompute_group_indices, scatter_for_grouped_gemm
+from pithtrain.operators.ring_attention.standard import ring_attention_func
 
 torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)
 
@@ -394,7 +395,6 @@ class DeepseekV2LiteAttention(nn.Module):
         self.o_proj = LinearCls(self.num_heads * self.v_head_dim, self.hidden_size, bias=False)
         self._init_rope()
         self.softmax_scale = self.q_head_dim ** (-0.5)
-        self.attn = MLA(self.num_heads, self.q_head_dim, self.v_head_dim, self.softmax_scale)
 
     def _init_rope(self):
         scaling_factor = self.config.rope_scaling["factor"]
@@ -444,18 +444,10 @@ class DeepseekV2LiteAttention(nn.Module):
         cos, sin = self.rotary_emb(value_states, seq_len=rope_seq_len)
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids, unsqueeze_dim=2)
 
-        query_states = k_pe.new_empty(bsz, q_len, self.num_heads, self.q_head_dim)
-        query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
-        query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
-
-        key_states = k_pe.new_empty(bsz, q_len, self.num_heads, self.q_head_dim)
-        key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
-        key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
-
         if self.use_ring_attn and not self._disable_ring_attn:
-            from pithtrain.operators.ring_attention.mla import ring_mla_attention_func
-
-            attn_output = ring_mla_attention_func(
+            query_states = torch.cat([q_nope, q_pe], dim=-1)
+            key_states = torch.cat([k_nope, k_pe.expand(-1, -1, self.num_heads, -1)], dim=-1)
+            attn_output = ring_attention_func(
                 query_states,
                 key_states,
                 value_states.contiguous(),
@@ -463,7 +455,12 @@ class DeepseekV2LiteAttention(nn.Module):
                 cp_group=self.cp_group,
             )
         else:
-            attn_output = self.attn(query_states, key_states, value_states.contiguous())
+            attn_output = mla_flash_attn_func(
+                q_nope, q_pe, k_nope, k_pe, value_states,
+                softmax_scale=self.softmax_scale,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                causal=True,
+            )
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
         attn_output = self.o_proj(attn_output)

@@ -71,8 +71,9 @@ class RingAttentionFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, softmax_scale, cp_rank, cp_size, global_ranks):
-        B, S, H, D = q.shape
-        combined_out = torch.zeros_like(q)
+        B, S, H, _ = q.shape
+        DV = v.shape[-1]
+        combined_out = torch.zeros((B, S, H, DV), dtype=q.dtype, device=q.device)
         combined_lse = torch.full(
             (B, H, S), torch.finfo(torch.float32).min, device=q.device, dtype=torch.float32
         )
