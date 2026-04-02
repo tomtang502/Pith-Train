@@ -39,7 +39,7 @@ class MemmapDataset:
     def get_chunk(
         self, idx: int, seq_offset: int, seq_length: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Read a sub-range of a sequence, avoiding unnecessary mmap page faults."""
+        """Read only [seq_offset, seq_offset + seq_length) of a sequence."""
         start = idx * self.sequence_length + seq_offset
         tokens = torch.tensor(self.tokens[start : start + seq_length])
         labels = torch.tensor(self.tokens[start + 1 : start + seq_length + 1])
