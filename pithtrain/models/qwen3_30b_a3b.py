@@ -546,8 +546,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         if isinstance(self.mlp, Qwen3MoeMLP):
             return ForwardAttnOutput(
-                hidden_states,
-                hidden_states,
+                hidden_states,  # sorted_tokens
                 None,
                 None,
                 None,
@@ -576,7 +575,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
         return ForwardAttnOutput(
-            hidden_states,
             sorted_tokens,
             idxs,
             topk_weight,
@@ -618,7 +616,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         moe_outs: torch.Tensor,
         moe_local_idxs: Optional[torch.Tensor],
         topk_weight: Optional[torch.Tensor],
-        moe_input_hidden_states: torch.Tensor,
         residual: torch.Tensor,
     ) -> torch.Tensor:
         """
@@ -627,18 +624,21 @@ class Qwen3MoeDecoderLayer(nn.Module):
         if isinstance(self.mlp, Qwen3MoeMoE):
             if self.mlp.ep_size > 1:
                 assert moe_local_idxs is not None
-                new_x = torch.empty_like(moe_outs)
-                new_x[moe_local_idxs] = moe_outs
+                seq_len, topk = topk_weight.shape
+                # Memory-efficient equivalent of
+                # new_x[moe_local_idxs] = moe_outs followed by weighted sum.
+                permuted_probs = topk_weight.view(-1)[moe_local_idxs]
+                token_indices = moe_local_idxs // topk
+                weighted = (moe_outs.float() * permuted_probs.unsqueeze(-1)).to(moe_outs.dtype)
+                hidden_states = moe_outs.new_zeros(seq_len, moe_outs.shape[-1])
+                hidden_states.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
+                hidden_states = hidden_states.view(*residual.shape)
             else:
                 assert moe_local_idxs is None
                 new_x = moe_outs
-
-            final_out = (
-                (new_x.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(dim=-1))
-                .sum(dim=1)
-                .to(new_x.dtype)
-            )
-            hidden_states = final_out.view(*moe_input_hidden_states.shape)
+                final_out = new_x.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(dim=-1)
+                final_out = final_out.sum(dim=1).to(new_x.dtype)
+                hidden_states = final_out.view(*residual.shape)
         else:
             assert moe_local_idxs is None
             assert topk_weight is None

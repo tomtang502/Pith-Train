@@ -29,7 +29,8 @@ from pithtrain.layers.factory import (
 from pithtrain.models.interface import ForwardAttnOutput
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
-from pithtrain.operators.mla import MLA
+from pithtrain.operators.flash_attn_v4 import mla_flash_attn_func
+from pithtrain.operators.ring_attention.standard import ring_attention_func
 from pithtrain.operators.token_scatter import precompute_group_indices, scatter_for_grouped_gemm
 
 torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)
@@ -394,7 +395,6 @@ class DeepseekV2LiteAttention(nn.Module):
         self.o_proj = LinearCls(self.num_heads * self.v_head_dim, self.hidden_size, bias=False)
         self._init_rope()
         self.softmax_scale = self.q_head_dim ** (-0.5)
-        self.attn = MLA(self.num_heads, self.q_head_dim, self.v_head_dim, self.softmax_scale)
 
     def _init_rope(self):
         scaling_factor = self.config.rope_scaling["factor"]
@@ -444,18 +444,10 @@ class DeepseekV2LiteAttention(nn.Module):
         cos, sin = self.rotary_emb(value_states, seq_len=rope_seq_len)
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids, unsqueeze_dim=2)
 
-        query_states = k_pe.new_empty(bsz, q_len, self.num_heads, self.q_head_dim)
-        query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
-        query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
-
-        key_states = k_pe.new_empty(bsz, q_len, self.num_heads, self.q_head_dim)
-        key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
-        key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
-
         if self.use_ring_attn and not self._disable_ring_attn:
-            from pithtrain.operators.ring_attention.mla import ring_mla_attention_func
-
-            attn_output = ring_mla_attention_func(
+            query_states = torch.cat([q_nope, q_pe], dim=-1)
+            key_states = torch.cat([k_nope, k_pe.expand(-1, -1, self.num_heads, -1)], dim=-1)
+            attn_output = ring_attention_func(
                 query_states,
                 key_states,
                 value_states.contiguous(),
@@ -463,7 +455,16 @@ class DeepseekV2LiteAttention(nn.Module):
                 cp_group=self.cp_group,
             )
         else:
-            attn_output = self.attn(query_states, key_states, value_states.contiguous())
+            attn_output = mla_flash_attn_func(
+                q_nope,
+                q_pe,
+                k_nope,
+                k_pe,
+                value_states,
+                softmax_scale=self.softmax_scale,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                causal=True,
+            )
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
         attn_output = self.o_proj(attn_output)
@@ -520,6 +521,9 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
+        if hasattr(self.mlp, "shared_experts"):
+            residual = residual + self.mlp.shared_experts(hidden_states)
+
         return hidden_states, residual
 
     def forward_attn(
@@ -532,9 +536,7 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
 
         assert isinstance(self.mlp, (DeepseekV2LiteMLP, DeepseekV2LiteMoEWithGroupGeMM))
         if isinstance(self.mlp, DeepseekV2LiteMLP):
-            # The MLP is not MoE, so we don't need to do expert selection
             return ForwardAttnOutput(
-                hidden_states,
                 hidden_states,  # sorted_tokens
                 None,  # idxs
                 None,  # topk_weight
@@ -563,7 +565,6 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
             self.mlp.ep_group,
         )
         return ForwardAttnOutput(
-            hidden_states,
             sorted_tokens,
             idxs,
             topk_weight,
@@ -603,34 +604,36 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
         moe_outs: torch.Tensor,
         moe_local_idxs: Optional[torch.Tensor],
         topk_weight: Optional[torch.Tensor],
-        moe_input_hidden_states: torch.Tensor,
         residual: torch.Tensor,
     ):
-        """Computation after all-to-all combine"""
+        """
+        Weighted expert output + residual connection.
+        Shared expert output is already folded into residual by forward_attn.
+        """
 
         def moe_finalize(moe_outs, moe_local_idxs, topk_weight) -> torch.Tensor:
             if self.mlp.ep_size > 1:
                 assert moe_local_idxs is not None
-                new_x = torch.empty_like(moe_outs)
-                new_x[moe_local_idxs] = moe_outs
+                seq_len, topk = topk_weight.shape
+                # Memory-efficient equivalent of
+                # new_x[moe_local_idxs] = moe_outs followed by weighted sum.
+                permuted_probs = topk_weight.view(-1)[moe_local_idxs]
+                token_indices = moe_local_idxs // topk
+                weighted = (moe_outs.float() * permuted_probs.unsqueeze(-1)).to(moe_outs.dtype)
+                result = moe_outs.new_zeros(seq_len, moe_outs.shape[-1])
+                result.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
+                return result
             else:
                 assert moe_local_idxs is None
                 new_x = moe_outs
-            final_out = (
-                (new_x.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(dim=-1))
-                .sum(dim=1)
-                .to(new_x.dtype)
-            )
-            return final_out
+                final_out = new_x.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(dim=-1)
+                final_out = final_out.sum(dim=1).to(new_x.dtype)
+                return final_out
 
         if isinstance(self.mlp, DeepseekV2LiteMoEWithGroupGeMM):
-            moe_y = moe_finalize(moe_outs, moe_local_idxs, topk_weight).view(
-                *moe_input_hidden_states.shape
+            hidden_states = moe_finalize(moe_outs, moe_local_idxs, topk_weight).view(
+                *residual.shape
             )
-            if self.mlp.config.n_shared_experts is not None:
-                moe_y = moe_y + self.mlp.shared_experts(moe_input_hidden_states)
-
-            hidden_states = moe_y
         else:
             assert moe_local_idxs is None
             assert topk_weight is None
