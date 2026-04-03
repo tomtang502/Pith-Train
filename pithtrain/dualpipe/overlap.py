@@ -8,7 +8,7 @@ computation-communication overlap.
 """
 
 from dataclasses import fields
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional
 
 import torch
 import torch.cuda.nvtx as nvtx
@@ -68,7 +68,6 @@ def _copy_layer_records(src: IntermediateTensorsLayer, dst: IntermediateTensorsL
 def overlapped_forward_backward(
     module0: ModelProtocol,
     inputs0: List[torch.Tensor],
-    const_inputs0: Tuple[torch.Tensor, ...],
     criterion0: Optional[Callable],
     labels0: Optional[List[torch.Tensor]],
     intermediate_tensors0: IntermediateTensors,
