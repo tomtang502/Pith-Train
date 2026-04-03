@@ -719,23 +719,21 @@ class DeepseekV2LiteModel(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = getattr(
             self, "_intermediate_tensors", None
         )
-        # If intermediate_tensors not provided, use reference forward (no intermediate state)
+
+        if self.embed_tokens is not None:
+            hidden_states = self.embed_tokens(hidden_states)
+
+        seq_len = hidden_states.shape[1]
+        offset = self.cp_rank * seq_len
+        cos, sin = self.rotary_emb(hidden_states, seq_len=offset + seq_len)
+        position_embeddings = (
+            cos[offset : offset + seq_len].unsqueeze(0).to(dtype=hidden_states.dtype),
+            sin[offset : offset + seq_len].unsqueeze(0).to(dtype=hidden_states.dtype),
+        )
+        for _, layer in self.layers.items():
+            layer._position_embeddings = position_embeddings
+
         if intermediate_tensors is None:
-            # Reference forward mode
-            if self.embed_tokens is not None:
-                hidden_states = self.embed_tokens(hidden_states)
-            seq_len = hidden_states.shape[1]
-            offset = self.cp_rank * seq_len
-            position_ids = torch.arange(
-                offset, offset + seq_len, device=hidden_states.device
-            ).unsqueeze(0)
-            cos, sin = self.rotary_emb(hidden_states, seq_len=offset + seq_len)
-            position_embeddings = (
-                cos[position_ids].to(dtype=hidden_states.dtype),
-                sin[position_ids].to(dtype=hidden_states.dtype),
-            )
-            for _, layer in self.layers.items():
-                layer._position_embeddings = position_embeddings
             for _, layer in self.layers.items():
                 ret = decoder_layer_forward(layer, hidden_states)
                 hidden_states = ret[0] if isinstance(ret, tuple) else ret
@@ -744,26 +742,10 @@ class DeepseekV2LiteModel(nn.Module):
                 hidden_states = self.lm_head(hidden_states)
             return hidden_states
 
-        # Use pre-allocated intermediate_tensors (modified in place)
         layer_idx = 0
         if self.embed_tokens is not None:
             intermediate_tensors.prolog.args = PrologArgs()
-            hidden_states = self.embed_tokens(hidden_states)
             intermediate_tensors.prolog.outs = PrologOuts(hidden_states)
-
-        seq_len = hidden_states.shape[1]
-        offset = self.cp_rank * seq_len
-        position_ids = torch.arange(
-            offset, offset + seq_len, device=hidden_states.device
-        ).unsqueeze(0)
-        cos, sin = self.rotary_emb(hidden_states, seq_len=offset + seq_len)
-        position_embeddings = (
-            cos[position_ids].to(dtype=hidden_states.dtype),
-            sin[position_ids].to(dtype=hidden_states.dtype),
-        )
-        for _, layer in self.layers.items():
-            layer._position_embeddings = position_embeddings
-
         for _, layer in self.layers.items():
             ret = decoder_layer_forward(layer, hidden_states)
             if len(ret) == 2:

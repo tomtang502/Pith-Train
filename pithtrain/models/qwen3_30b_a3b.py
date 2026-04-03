@@ -70,31 +70,29 @@ class Qwen3MoeRotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
-    def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Return cos and sin for the given position ids.
+        Return the cos/sin cache up to ``seq_len`` positions.
 
         Parameters
         ----------
         x : torch.Tensor
             Input tensor, used only for dtype.
-        position_ids : torch.Tensor
-            Position indices of shape [batch_size, seq_len].
+        seq_len : int
+            Required cache length (global, i.e. includes CP offset).
 
         Returns
         -------
         Tuple[torch.Tensor, torch.Tensor]
-            Cosine and sine embeddings.
+            Cosine and sine tables of shape ``[seq_len, head_dim]``.
         """
-        seq_len = position_ids.max().item() + 1
         if seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len, x.device, x.dtype)
 
-        cos = self.cos_cached[position_ids].to(dtype=x.dtype)
-        sin = self.sin_cached[position_ids].to(dtype=x.dtype)
-        return cos, sin
+        return (
+            self.cos_cached[:seq_len].to(dtype=x.dtype),
+            self.sin_cached[:seq_len].to(dtype=x.dtype),
+        )
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -796,11 +794,11 @@ class Qwen3MoeModel(nn.Module):
         bsz, seq_len, _ = hidden_states.shape
 
         offset = self.cp_rank * seq_len
-        position_ids = torch.arange(
-            offset, offset + seq_len, device=hidden_states.device
-        ).unsqueeze(0)
-
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        cos, sin = self.rotary_emb(hidden_states, seq_len=offset + seq_len)
+        position_embeddings = (
+            cos[offset : offset + seq_len].unsqueeze(0),
+            sin[offset : offset + seq_len].unsqueeze(0),
+        )
 
         for layer_idx_str, layer in self.layers.items():
             layer._position_embeddings = position_embeddings
