@@ -284,6 +284,7 @@ def save_checkpoint(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx
     DTensors are kept as CPU DTensors and DCP saves each rank's shard.
     """
     stdout = ctx.logging.stdout
+    assert cfg.training.save_location is not None
     save_location = Path(cfg.training.save_location, "torch-dcp", "step-%08d" % ctx.training.step)
     model = ctx.training.model
     optimizer = ctx.training.optimizer
@@ -317,6 +318,9 @@ def load_checkpoint(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx
     Load the checkpoint from the latest step.
     """
     stdout = ctx.logging.stdout
+    if cfg.training.save_location is None:
+        stdout.info("No save_location set; training from scratch.")
+        return
     path2step = lambda p: int(p.stem.removeprefix("step-"))
     checkpoints = Path(cfg.training.save_location, "torch-dcp").glob("step-*")
     checkpoints = sorted(checkpoints, key=path2step)
@@ -418,12 +422,15 @@ def train_step(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx) -> 
     torch.distributed.all_reduce(peak_gpu_mem, op=torch.distributed.ReduceOp.MAX)
 
     # Collect the mean load balance loss (reduced across all ranks).
+    # The tracked values include the coefficient: lb_coef * E * dot(f, p).
+    # We divide it out so the logged metric is E * dot(f, p), where 1.0
+    # represents perfect balance (matches Megatron-LM convention).
     moe_load_balance_coef = cfg.training.moe_load_balance_coef
     lb_total, lb_count = MoELoadBalanceLossTracker.get_total_count_and_clear()
     if moe_load_balance_coef > 0:
         lb_stats = torch.tensor([lb_total, lb_count], device=device)
         torch.distributed.all_reduce(lb_stats, op=torch.distributed.ReduceOp.SUM)
-        lb_loss = (lb_stats[0] / lb_stats[1]).item() if lb_stats[1] > 0 else 0.0
+        lb_loss = (lb_stats[0] / lb_stats[1]).item() / moe_load_balance_coef
     else:
         lb_loss = 0.0
 
@@ -466,11 +473,13 @@ def train_step(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx) -> 
     # We should save the checkpoint if any of the following conditions is true:
     # 1. The current step is a multiple of save_interval.
     # 2. The current step is the last step (max_steps).
-    should_save = False
-    should_save |= ctx.training.step % cfg.training.save_interval == 0
-    should_save |= ctx.training.step == cfg.training.max_steps
-    if should_save:
-        save_checkpoint(cfg, ctx)
+    # Skip entirely if save_interval is None.
+    if cfg.training.save_interval is not None:
+        should_save = False
+        should_save |= ctx.training.step % cfg.training.save_interval == 0
+        should_save |= ctx.training.step == cfg.training.max_steps
+        if should_save:
+            save_checkpoint(cfg, ctx)
 
     # Run deferred GC here so cyclic collection never fires mid-forward/backward.
     gc.collect()
