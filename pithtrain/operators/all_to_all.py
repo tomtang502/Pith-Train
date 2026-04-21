@@ -1,6 +1,4 @@
-"""
-PyTorch implementation of all-to-all communication operator.
-"""
+"""PyTorch implementation of all-to-all communication operator."""
 
 from typing import List
 
@@ -15,9 +13,10 @@ _all_to_all_single = torch.compiler.disable(torch.distributed.all_to_all_single)
 # Pad all-to-all output allocations to multiples of this many rows.
 # Reduces CUDA memory fragmentation by collapsing varying allocation sizes
 # into the same caching-allocator bucket for reuse across micro-batches.
-_ALLTOALL_PAD_ALIGNMENT = 512
+_ALLTOALL_PAD_ALIGNMENT = 1024
 
 
+@torch.no_grad()
 def direct_all_to_all(
     input: torch.Tensor,
     output_split_sizes: List[int],

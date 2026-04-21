@@ -22,12 +22,27 @@ from pithtrain.operators.all_to_all import direct_all_to_all
 
 @dataclass(init=False, slots=True)
 class ExecutionCtx:
+    """Shared context for the overlapped forward-backward execution loop."""
+
     comp_stream: torch.cuda.Stream
+    """Main compute stream for forward/backward kernels."""
     comm_stream: torch.cuda.Stream
+    """Separate stream for asynchronous all-to-all communication."""
     fwd_event: torch.cuda.Event
+    """Event recorded after forward compute; comm_stream waits on it before dispatch."""
     bwd_event: torch.cuda.Event
+    """Event recorded after backward compute; comm_stream waits on it before combine."""
     fwd_comm_work: Optional[torch.distributed.Work]
+    """Async work handle for the in-flight forward all-to-all (dispatch or combine)."""
     bwd_comm_work: Optional[torch.distributed.Work]
+    """Async work handle for the in-flight backward all-to-all."""
+    fwd_comm_deferred_free: List[torch.Tensor]
+    """Tensors whose storage should be freed after the next fwd_comm_work.wait().
+
+    Callers append tensors here after launching async forward comms (e.g.
+    all-to-all in Stage 2 / Stage 4).  The subsequent stage that waits on
+    fwd_comm_work drains and frees this list automatically.
+    """
 
 
 # ------------------------------------------------------------
@@ -62,9 +77,7 @@ def stage1_f(
     layer: DecoderLayerProtocol,
     hidden_states: torch.Tensor,
 ):
-    """
-    Stage1 forward.
-    """
+    """Stage1 forward."""
     nvtx.range_push("layer%02d.stage1_f" % layer.idx)
     record = Stage1Record()
 
@@ -90,9 +103,7 @@ def stage1_b(
     record: Stage1Record,
     grad_tensors: Union[Stage1OutsMoe, Stage1OutsMlp],
 ):
-    """
-    Stage1 backward.
-    """
+    """Stage1 backward."""
     nvtx.range_push("layer%02d.stage1_b" % layer.idx)
 
     if ctx.bwd_comm_work is not None:
@@ -112,18 +123,8 @@ def stage1_b(
 # ------------------------------------------------------------
 
 
-class Stage2Args(NamedTuple):
-    sorted_tokens: torch.Tensor
-
-
-class Stage2Outs(NamedTuple):
-    gathered_tokens: torch.Tensor
-
-
 @dataclass(init=False, slots=True)
 class Stage2Record:
-    args: Stage2Args
-    outs: Stage2Outs
     ctx: Optional[tuple]
 
 
@@ -135,17 +136,13 @@ def stage2_f(
     input_splits: Optional[List[int]],
     ep_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
-    """
-    Stage2 forward.
-    """
+    """Stage2 forward: all-to-all dispatch for expert parallelism."""
     nvtx.range_push("layer%02d.stage2_f" % layer.idx)
     record = Stage2Record()
 
-    sorted_tokens = sorted_tokens.detach().requires_grad_()
-    record.args = Stage2Args(sorted_tokens)
-
     ctx.comm_stream.wait_event(ctx.fwd_event)
 
+    sorted_tokens = sorted_tokens.detach()
     if output_splits is not None:
         with torch.cuda.stream(ctx.comm_stream):
             gathered_tokens = direct_all_to_all(
@@ -155,7 +152,6 @@ def stage2_f(
     else:
         gathered_tokens = sorted_tokens
         record.ctx = None
-    record.outs = Stage2Outs(gathered_tokens)
 
     ctx.fwd_comm_work = getattr(gathered_tokens, "comm_work", None)
     setattr(gathered_tokens, "comm_work", None)
@@ -168,11 +164,9 @@ def stage2_b(
     ctx: ExecutionCtx,
     layer: DecoderLayerProtocol,
     record: Stage2Record,
-    grad_tensors: Stage2Outs,
+    grad_tensors: tuple,
 ):
-    """
-    Stage2 backward.
-    """
+    """Stage2 backward: reverse all-to-all."""
     nvtx.range_push("layer%02d.stage2_b" % layer.idx)
 
     ctx.comm_stream.wait_event(ctx.bwd_event)
@@ -212,6 +206,13 @@ class Stage3Record:
     outs: Stage3Outs
 
 
+def _drain_deferred_free(ctx: ExecutionCtx) -> None:
+    """Free tensor storage that was deferred until after the comm wait."""
+    for t in ctx.fwd_comm_deferred_free:
+        t.untyped_storage().resize_(0)
+    ctx.fwd_comm_deferred_free.clear()
+
+
 def stage3_f(
     ctx: ExecutionCtx,
     layer: DecoderLayerProtocol,
@@ -219,9 +220,7 @@ def stage3_f(
     expert_idxs: Optional[torch.Tensor],
     expand_idx: Optional[torch.Tensor] = None,
 ):
-    """
-    Stage3 forward.
-    """
+    """Stage3 forward."""
     nvtx.range_push("layer%02d.stage3_f" % layer.idx)
     record = Stage3Record()
 
@@ -230,9 +229,15 @@ def stage3_f(
 
     if ctx.fwd_comm_work is not None:
         ctx.fwd_comm_work.wait()
+    _drain_deferred_free(ctx)
 
     moe_outs = layer.forward_mlp(gathered_tokens, expert_idxs, expand_idx)
     record.outs = Stage3Outs(moe_outs)
+    # Free the args storage - only safe for MoE layers with EP where
+    # padded_index_gather is the first consumer and doesn't save the input.
+    # When ep_size==1, gathered_tokens shares storage with sorted_tokens.
+    if hasattr(layer.mlp, "experts") and ctx.fwd_comm_work is not None:
+        gathered_tokens.untyped_storage().resize_(0)
 
     ctx.comp_stream.record_event(ctx.fwd_event)
 
@@ -246,9 +251,7 @@ def stage3_b(
     record: Stage3Record,
     grad_tensors: Stage3Outs,
 ):
-    """
-    Stage3 backward for input.
-    """
+    """Stage3 backward for input."""
     nvtx.range_push("layer%02d.stage3_b" % layer.idx)
 
     if ctx.bwd_comm_work is not None:
@@ -267,9 +270,7 @@ def stage3_b(
 
 
 def stage3_w(ctx: ExecutionCtx, layer: DecoderLayerProtocol):
-    """
-    Stage3 backward for weight.
-    """
+    """Stage3 backward for weight."""
     nvtx.range_push("layer%02d.stage3_w" % layer.idx)
 
     WeightGradStore.flush()
@@ -283,18 +284,8 @@ def stage3_w(ctx: ExecutionCtx, layer: DecoderLayerProtocol):
 # ------------------------------------------------------------
 
 
-class Stage4Args(NamedTuple):
-    moe_outs: torch.Tensor
-
-
-class Stage4Outs(NamedTuple):
-    moe_outs: torch.Tensor
-
-
 @dataclass(init=False, slots=True)
 class Stage4Record:
-    args: Stage4Args
-    outs: Stage4Outs
     ctx: Optional[tuple]
 
 
@@ -306,15 +297,11 @@ def stage4_f(
     output_splits: Optional[List[int]],
     ep_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
-    """
-    Stage4 forward.
-    """
+    """Stage4 forward: all-to-all combine for expert parallelism."""
     nvtx.range_push("layer%02d.stage4_f" % layer.idx)
     record = Stage4Record()
 
-    moe_outs = moe_outs.detach().requires_grad_()
-    record.args = Stage4Args(moe_outs)
-
+    moe_outs = moe_outs.detach()
     ctx.comm_stream.wait_event(ctx.fwd_event)
 
     if output_splits is not None:
@@ -323,8 +310,6 @@ def stage4_f(
         record.ctx = (input_splits, output_splits, ep_group)
     else:
         record.ctx = None
-
-    record.outs = Stage4Outs(moe_outs)
 
     ctx.fwd_comm_work = getattr(moe_outs, "comm_work", None)
     setattr(moe_outs, "comm_work", None)
@@ -337,11 +322,9 @@ def stage4_b(
     ctx: ExecutionCtx,
     layer: DecoderLayerProtocol,
     record: Stage4Record,
-    grad_tensors: Stage4Outs,
+    grad_tensors: tuple,
 ):
-    """
-    Stage4 backward.
-    """
+    """Stage4 backward: reverse all-to-all."""
     nvtx.range_push("layer%02d.stage4_b" % layer.idx)
 
     ctx.comm_stream.wait_event(ctx.bwd_event)
@@ -389,9 +372,7 @@ def stage5_f(
     topk_weight: torch.Tensor,
     residual: torch.Tensor,
 ):
-    """
-    Stage5 forward.
-    """
+    """Stage5 forward."""
     nvtx.range_push("layer%02d.stage5_f" % layer.idx)
     record = Stage5Record()
 
@@ -402,6 +383,7 @@ def stage5_f(
 
     if ctx.fwd_comm_work is not None:
         ctx.fwd_comm_work.wait()
+    _drain_deferred_free(ctx)
 
     hidden_states = layer.forward_aggregate(moe_outs, moe_local_idxs, topk_weight, residual)
     record.outs = Stage5Outs(hidden_states)
@@ -416,9 +398,7 @@ def stage5_b(
     record: Stage5Record,
     grad_tensors: Stage5Outs,
 ):
-    """
-    Stage5 backward.
-    """
+    """Stage5 backward."""
     nvtx.range_push("layer%02d.stage5_b" % layer.idx)
 
     run_backward(record.outs, grad_tensors)
@@ -460,6 +440,7 @@ def stage5_and_stage1_f(
 
     if ctx.fwd_comm_work is not None:
         ctx.fwd_comm_work.wait()
+    _drain_deferred_free(ctx)
 
     hidden_states = prev_layer.forward_aggregate(moe_outs, moe_local_idxs, topk_weight, residual)
 
@@ -524,9 +505,7 @@ class PrologRecord:
 
 
 def prolog_f(module: ModelProtocol, hidden_states: torch.Tensor):
-    """
-    Prolog forward.
-    """
+    """Prolog forward."""
     nvtx.range_push("prolog_f")
     record = PrologRecord()
 
@@ -539,9 +518,7 @@ def prolog_f(module: ModelProtocol, hidden_states: torch.Tensor):
 
 
 def prolog_b(module: ModelProtocol, record: PrologRecord, grad_tensors: PrologOuts):
-    """
-    Prolog backward.
-    """
+    """Prolog backward."""
     nvtx.range_push("prolog_b")
 
     run_backward(record.outs, grad_tensors)
@@ -559,19 +536,18 @@ class EpilogArgs(NamedTuple):
     hidden_states: torch.Tensor
 
 
-class EpilogOuts(NamedTuple):
-    logits: torch.Tensor
-
-
 @dataclass(init=False, slots=True)
 class EpilogRecord:
     args: EpilogArgs
-    outs: EpilogOuts
 
 
 def epilog_f(module: ModelProtocol, hidden_states: torch.Tensor):
     """
     Epilog forward: norm + lm_head.
+
+    The backward is handled by ``loss.backward()`` which traverses the autograd
+    graph through norm -> lm_head -> criterion.  The only thing the caller needs
+    from the record is ``args.hidden_states.grad`` (populated by autograd).
     """
     nvtx.range_push("epilog_f")
     record = EpilogRecord()
@@ -580,23 +556,9 @@ def epilog_f(module: ModelProtocol, hidden_states: torch.Tensor):
     record.args = EpilogArgs(hidden_states)
     hidden_states = module.norm(hidden_states)
     logits = module.lm_head(hidden_states)
-    record.outs = EpilogOuts(logits)
 
     nvtx.range_pop()
     return record, logits
-
-
-def epilog_b(module: ModelProtocol, record: EpilogRecord, grad_tensors: EpilogOuts):
-    """
-    Epilog backward.
-    """
-    nvtx.range_push("epilog_b")
-
-    run_backward(record.outs, grad_tensors)
-    hidden_states_grad = record.args.hidden_states.grad
-
-    nvtx.range_pop()
-    return hidden_states_grad
 
 
 # ------------------------------------------------------------
@@ -621,14 +583,14 @@ class IntermediateTensors:
 
 
 def create_intermediate_tensors_layer() -> IntermediateTensorsLayer:
-    """
-    Create a pre-allocated IntermediateTensorsLayer with all records.
-    """
+    """Create a pre-allocated IntermediateTensorsLayer with all records."""
     layer = IntermediateTensorsLayer()
     layer.stage1 = Stage1Record()
     layer.stage2 = Stage2Record()
+    layer.stage2.ctx = None
     layer.stage3 = Stage3Record()
     layer.stage4 = Stage4Record()
+    layer.stage4.ctx = None
     layer.stage5 = Stage5Record()
     return layer
 
@@ -636,9 +598,7 @@ def create_intermediate_tensors_layer() -> IntermediateTensorsLayer:
 def create_intermediate_tensors(
     num_layers: int, has_prolog: bool, has_epilog: bool
 ) -> IntermediateTensors:
-    """
-    Create a pre-allocated IntermediateTensors structure for reuse across iterations.
-    """
+    """Create a pre-allocated IntermediateTensors structure for reuse across iterations."""
     tensors = IntermediateTensors()
     tensors.prolog = PrologRecord() if has_prolog else None
     tensors.epilog = EpilogRecord() if has_epilog else None

@@ -1,6 +1,4 @@
-"""
-deepseek-ai/DeepSeek-V2-Lite.
-"""
+"""deepseek-ai/DeepSeek-V2-Lite."""
 
 import math
 from dataclasses import fields
@@ -12,26 +10,22 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from pithtrain.dualpipe.execution import (
-    EpilogArgs,
-    EpilogOuts,
-    IntermediateTensors,
-    PrologArgs,
-    PrologOuts,
-)
+from pithtrain.dualpipe.execution import EpilogArgs, IntermediateTensors, PrologArgs, PrologOuts
+from pithtrain.dualpipe.layer_partition import layer_partition
 from pithtrain.dualpipe.modeling import decoder_layer_backward, decoder_layer_forward
 from pithtrain.dualpipe.utils import run_backward
-from pithtrain.layers.factory import (
-    ModelImplMode,
-    get_group_linear_cls,
-    get_linear_cls,
-)
+from pithtrain.layers.factory import ModelImplMode, get_group_linear_cls, get_linear_cls
 from pithtrain.models.interface import ForwardAttnOutput
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import mla_flash_attn_func
 from pithtrain.operators.ring_attention.standard import ring_attention_func
-from pithtrain.operators.token_scatter import precompute_group_indices, scatter_for_grouped_gemm
+from pithtrain.operators.silu_mul import silu_mul
+from pithtrain.operators.token_scatter import (
+    padded_index_gather,
+    precompute_group_indices,
+    scatter_for_grouped_gemm,
+)
 
 torch._dynamo.allow_in_graph(MoELoadBalanceLossInjector)
 
@@ -200,12 +194,11 @@ class DeepseekV2LiteMLP(nn.Module):
         self.gate_proj = LinearCls(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = LinearCls(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = LinearCls(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = nn.SiLU()
 
     def forward(self, x):
-        g = self.act_fn(self.gate_proj(x))
+        g = self.gate_proj(x)
         u = self.up_proj(x)
-        return self.down_proj(g * u)
+        return self.down_proj(silu_mul(g, u))
 
 
 class DeepseekV2LiteExperts(nn.Module):
@@ -225,7 +218,6 @@ class DeepseekV2LiteExperts(nn.Module):
         self.gate_proj = GroupLinearCls(num_experts, self.hidden_size, self.intermediate_size)
         self.up_proj = GroupLinearCls(num_experts, self.hidden_size, self.intermediate_size)
         self.down_proj = GroupLinearCls(num_experts, self.intermediate_size, self.hidden_size)
-        self.act_fn = nn.SiLU()
 
     def forward(
         self,
@@ -236,9 +228,9 @@ class DeepseekV2LiteExperts(nn.Module):
     ):
         gi = precompute_group_indices(grouped_mm_offs, x.shape[0])
         kwargs = dict(grouped_mm_offs=grouped_mm_offs, ks=ks, ks_tensor=ks_tensor, group_indices=gi)
-        g = self.act_fn(self.gate_proj(x, **kwargs))
+        g = self.gate_proj(x, **kwargs)
         u = self.up_proj(x, **kwargs)
-        return self.down_proj(g * u, **kwargs)
+        return self.down_proj(silu_mul(g, u), **kwargs)
 
 
 class DeepseekV2LiteMoEGate(nn.Module):
@@ -557,12 +549,13 @@ class DeepseekV2LiteDecoderLayer(nn.Module):
 
         assert expert_idxs is not None
         if expand_idx is not None:
-            gathered_tokens = gathered_tokens[expand_idx]
+            gathered_tokens = padded_index_gather(gathered_tokens, expand_idx)
         output_tokens, reverse_shuffle_idxs, grouped_mm_offs, ks, ks_tensor = (
             scatter_for_grouped_gemm(gathered_tokens, expert_idxs, self.mlp.experts_per_rank)
         )
+        del gathered_tokens  # free expanded tokens; no longer needed after scatter
         outs = self.mlp.experts(output_tokens, grouped_mm_offs, ks=ks, ks_tensor=ks_tensor)
-        outs = outs[reverse_shuffle_idxs]
+        outs = padded_index_gather(outs, reverse_shuffle_idxs)
         return outs
 
     @torch.compile(fullgraph=True)
@@ -669,10 +662,7 @@ class DeepseekV2LiteModel(nn.Module):
         # Naive layer partition may cause stage -1 to have fewer layers than other stages,
         # which further leads to imbalance. So we use this partition, trying to achieve
         # a more balanced partition.
-        num_local_layers = [config.num_hidden_layers // num_stages for _ in range(num_stages)]
-        layers_per_stage_residual = config.num_hidden_layers % num_stages
-        for i in range(layers_per_stage_residual):
-            num_local_layers[(1 - (i % 2) * 2) * (i // 2) - (i % 2)] += 1
+        num_local_layers = layer_partition(config.num_hidden_layers, num_stages)
         layer_id_begin = sum(num_local_layers[:stage_id])
         layer_id_end = layer_id_begin + num_local_layers[stage_id]
         self.layers = nn.ModuleDict(
@@ -754,9 +744,6 @@ class DeepseekV2LiteModel(nn.Module):
                 dst = intermediate_tensors.layers[layer_idx]
                 for field in fields(layer_record):
                     src_rec = getattr(layer_record, field.name)
-                    # Skip records where args wasn't set (record exists but wasn't used)
-                    if not hasattr(src_rec, "args"):
-                        continue
                     dst_rec = getattr(dst, field.name)
                     for rf in fields(src_rec):
                         if hasattr(src_rec, rf.name):
@@ -778,7 +765,6 @@ class DeepseekV2LiteModel(nn.Module):
             intermediate_tensors.epilog.args = EpilogArgs(hidden_states)
             hidden_states = self.norm(hidden_states)
             hidden_states = self.lm_head(hidden_states)
-            intermediate_tensors.epilog.outs = EpilogOuts(hidden_states)
 
         return hidden_states
 
@@ -798,7 +784,6 @@ class DeepseekV2LiteModel(nn.Module):
             dy = (intermediate_tensors.epilog.args.hidden_states.grad,)
             # Clear tensor refs but keep pre-allocated record
             intermediate_tensors.epilog.args = None
-            intermediate_tensors.epilog.outs = None
             loss = None
         else:
             assert module.norm is None

@@ -31,10 +31,7 @@ import torch.nn as nn
 from torch.distributed.fsdp import FSDPModule, fully_shard
 
 from pithtrain.dualpipe import comm
-from pithtrain.dualpipe.execution import (
-    IntermediateTensors,
-    create_intermediate_tensors,
-)
+from pithtrain.dualpipe.execution import IntermediateTensors, create_intermediate_tensors
 from pithtrain.dualpipe.overlap import overlapped_forward_backward
 from pithtrain.dualpipe.utils import FP8WeightCacheControl, WeightGradStore, gather, scatter
 
@@ -91,9 +88,7 @@ class DualPipeV(nn.Module):
         ] = ([], [])
 
     def _ensure_intermediate_tensors_allocated(self, num_chunks: int) -> None:
-        """
-        Pre-allocate IntermediateTensors structures for reuse across iterations.
-        """
+        """Pre-allocate IntermediateTensors structures for reuse across iterations."""
         if self._num_chunks_allocated == num_chunks:
             return
         self.intermediate_tensors_chunks = (
@@ -206,7 +201,6 @@ class DualPipeV(nn.Module):
                     None,
                     self.intermediate_tensors_chunks[phase][chunk_id],
                 )
-                # run_backward(outputs, output_grads)
         # Note: intermediate_tensors is pre-allocated and reused; backward clears tensor refs inside
         WeightGradStore.enabled = False
         if enable_zb:
@@ -456,7 +450,7 @@ class DualPipeV(nn.Module):
                 module.set_requires_gradient_sync(False)
                 # Suppress FSDP's root post-backward callback during the pipeline
                 # loop. Each run_backward() would otherwise queue this callback,
-                # which iterates ALL FSDP states (~150-250 µs CPU overhead per
+                # which iterates ALL FSDP states (~150-250 us CPU overhead per
                 # backward stage). The flag resets when run_post_backward() calls
                 # _root_post_backward_final_callback() directly after the loop.
                 if not self.forward_only:

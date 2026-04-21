@@ -1,6 +1,4 @@
-"""
-Pretrain a language model.
-"""
+"""Pretrain a language model."""
 
 import gc
 import time
@@ -13,7 +11,6 @@ import torch
 import torch.cuda
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-import torch.nn.functional as F
 import wandb
 from torch.distributed._tensor import DTensor
 from torch.distributed.checkpoint import FileSystemReader
@@ -38,58 +35,41 @@ from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distri
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, LoggingCtx, activate_wandb, logging_context
 from pithtrain.modules.training import TrainingCfg, TrainingCtx, training_context
+from pithtrain.operators.cross_entropy import cross_entropy
 
 
 @dataclass(init=False, slots=True)
 class PretrainLanguageModelCfg(SlottedDefault):
-    """
-    Configuration for pretraining a language model.
-    """
+    """Configuration for pretraining a language model."""
 
     distributed: DistributedCfg = field(default_factory=DistributedCfg)
-    """
-    Distributed training configuration.
-    """
+    """Distributed training configuration."""
 
     training: TrainingCfg = field(default_factory=TrainingCfg)
-    """
-    Training configuration including model, optimizer, and dataset settings.
-    """
+    """Training configuration including model, optimizer, and dataset settings."""
 
     logging: LoggingCfg = field(default_factory=LoggingCfg)
-    """
-    Logging configuration.
-    """
+    """Logging configuration."""
 
 
 @dataclass(init=False, slots=True)
 class PretrainLanguageModelCtx(SlottedDefault):
-    """
-    Context for pretraining a language model.
-    """
+    """Context for pretraining a language model."""
 
     logging: LoggingCtx = field(default_factory=LoggingCtx)
-    """
-    Active logging context.
-    """
+    """Active logging context."""
 
     distributed: DistributedCtx = field(default_factory=DistributedCtx)
-    """
-    Active distributed context.
-    """
+    """Active distributed context."""
 
     training: TrainingCtx = field(default_factory=TrainingCtx)
-    """
-    Active training context.
-    """
+    """Active training context."""
 
 
 def get_global_batch(
     cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx, device: torch.device
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """
-    Gather this rank's portion of the global batch on pipeline parallel rank 0.
-    """
+    """Gather this rank's portion of the global batch on pipeline parallel rank 0."""
     if ctx.distributed.pp_rank != 0:
         return None, None
 
@@ -138,9 +118,9 @@ def get_global_batch(
 
 
 def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    output = output.view(-1, output.size(-1)).float()
+    output = output.view(-1, output.size(-1))
     target = target.view(-1)
-    return F.cross_entropy(output, target, ignore_index=-100)
+    return cross_entropy(output, target, ignore_index=-100)
 
 
 @torch.no_grad()
@@ -175,9 +155,7 @@ def clip_grad_norm_(model: nn.Module, max_norm: float, norm_type: float = 2.0) -
 
 
 class AppState(Stateful):
-    """
-    Stateful object to save and load the checkpoint.
-    """
+    """Stateful object to save and load the checkpoint."""
 
     def __init__(
         self,
@@ -243,9 +221,7 @@ class AppState(Stateful):
 def raise_if_dataset_insufficient(
     cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx
 ) -> None:
-    """
-    Raise if configured run requires more samples than available in dataset.
-    """
+    """Raise if configured run requires more samples than available in dataset."""
     global_batch_size = cfg.training.global_batch_size
     max_steps = cfg.training.max_steps
 
@@ -314,9 +290,7 @@ def save_checkpoint(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx
 
 
 def load_checkpoint(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx) -> None:
-    """
-    Load the checkpoint from the latest step.
-    """
+    """Load the checkpoint from the latest step."""
     stdout = ctx.logging.stdout
     if cfg.training.save_location is None:
         stdout.info("No save_location set; training from scratch.")
@@ -350,13 +324,14 @@ def load_checkpoint(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx
 
 
 def train_step(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx) -> None:
-    """
-    Execute one step of training.
-    """
-    if cfg.training.nsys_start is not None and ctx.training.step == cfg.training.nsys_start:
+    """Execute one step of training."""
+    # Start the nsys and the memory profiler.
+    start = cfg.training.nsys_start
+    if start is not None and ctx.training.step == start:
         torch.cuda.cudart().cudaProfilerStart()
-    if cfg.training.nsys_stop is not None and ctx.training.step == cfg.training.nsys_stop:
-        torch.cuda.cudart().cudaProfilerStop()
+    start = cfg.training.memory_profile_start
+    if start is not None and ctx.training.step == start:
+        torch.cuda.memory._record_memory_history(max_entries=65536, stacks="python")
 
     device = torch.cuda.current_device()
     t0 = time.time()
@@ -470,6 +445,18 @@ def train_step(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx) -> 
     # Increment the step counter.
     ctx.training.step += 1
 
+    # Stop the nsys and the memory profiler.
+    stop = cfg.training.nsys_stop
+    if stop is not None and ctx.training.step == stop:
+        torch.cuda.cudart().cudaProfilerStop()
+    stop = cfg.training.memory_profile_stop
+    if stop is not None and ctx.training.step == stop:
+        rank = ctx.distributed.rank
+        cfg.training.memory_profile_output.mkdir(parents=True, exist_ok=True)
+        path = Path(cfg.training.memory_profile_output, "snapshot-rank%05d.pickle" % rank)
+        torch.cuda.memory._dump_snapshot(str(path))
+        torch.cuda.memory._record_memory_history(enabled=None)
+
     # We should save the checkpoint if any of the following conditions is true:
     # 1. The current step is a multiple of save_interval.
     # 2. The current step is the last step (max_steps).
@@ -486,9 +473,7 @@ def train_step(cfg: PretrainLanguageModelCfg, ctx: PretrainLanguageModelCtx) -> 
 
 
 def launch(cfg: PretrainLanguageModelCfg) -> None:
-    """
-    Launch the pretraining of a language model.
-    """
+    """Launch the pretraining of a language model."""
     with ExitStack() as stack:
         ctx = PretrainLanguageModelCtx()
         stack.enter_context(logging_context(cfg, ctx))

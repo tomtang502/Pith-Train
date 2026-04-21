@@ -1,5 +1,9 @@
-"""
-Checkpoint conversion from HuggingFace to DCP and vice versa.
+"""Generic HF<->DCP conversion, dispatcher, and launch entry-point.
+
+Model-specific converters (quantized weights, stacked experts, layout
+transposes) live in sibling modules and are registered in
+``_registry.CONVERTERS``. The generic path here handles un-quantized,
+un-transposed HF checkpoints (Qwen3, DeepSeek-V2).
 """
 
 import json
@@ -18,56 +22,46 @@ from torch.distributed.checkpoint import FileSystemReader
 from pithtrain.config import SlottedDefault
 from pithtrain.modules.logging import LoggingCfg, LoggingCtx, logging_context
 
+from ._registry import CONVERTERS
+
 
 @dataclass(init=False, slots=True)
 class ConvertCheckpointCfg(SlottedDefault):
-    """
-    Configuration for checkpoint conversion.
-    """
+    """Configuration for checkpoint conversion."""
 
     operation: Literal["hf2dcp", "dcp2hf"]
-    """
-    Conversion operation: "hf2dcp" or "dcp2hf".
-    """
+    """Conversion operation."""
 
     load_path: Path
-    """
-    Source checkpoint directory to load from.
-    """
+    """Source checkpoint directory."""
 
     save_path: Path
-    """
-    Destination checkpoint directory to save to.
-    """
+    """Destination checkpoint directory."""
 
     max_shard_size: int = 8 * 1024**3
-    """
-    Maximum shard size in bytes for dcp2hf (default 8GB).
-    """
+    """Maximum dcp2hf shard size in bytes (default 8GB)."""
 
     logging: LoggingCfg = field(default_factory=LoggingCfg)
-    """
-    Logging configuration.
-    """
+    """Logging configuration."""
 
 
 @dataclass(init=False, slots=True)
 class ConvertCheckpointCtx(SlottedDefault):
-    """
-    Context for checkpoint conversion.
-    """
+    """Context for checkpoint conversion."""
 
     logging: LoggingCtx = field(default_factory=LoggingCtx)
-    """
-    Active logging context.
-    """
+    """Active logging context."""
 
 
 def hf2dcp(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
-    """
-    Convert HuggingFace checkpoint to DCP format.
-    """
+    """Convert HuggingFace checkpoint to DCP format."""
     load_path, save_path = Path(cfg.load_path), Path(cfg.save_path)
+
+    for converter in CONVERTERS:
+        if converter.detect_hf(load_path):
+            stdout.info("Dispatching hf2dcp to %s converter" % converter.name)
+            converter.hf2dcp(load_path, save_path, stdout)
+            return
 
     with open(Path(load_path, "model.safetensors.index.json")) as f:
         weight_map = json.load(f)["weight_map"]
@@ -88,9 +82,7 @@ def hf2dcp(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
 
 
 def dcp2hf(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
-    """
-    Convert DCP checkpoint to HuggingFace format.
-    """
+    """Convert DCP checkpoint to HuggingFace format."""
     load_path, save_path = Path(cfg.load_path), Path(cfg.save_path)
     max_shard_size = cfg.max_shard_size
     stdout.info("Converting DCP checkpoint from %s" % load_path)
@@ -103,9 +95,16 @@ def dcp2hf(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
     dcp.load(state_dict, checkpoint_id=load_path, no_dist=True)
     stdout.info("Loaded %d model weights from DCP" % len(state_dict))
 
+    canonical = {k.removeprefix(model_prefix): v for k, v in state_dict.items()}
+
+    for converter in CONVERTERS:
+        if converter.detect_dcp(metadata):
+            stdout.info("Dispatching dcp2hf postprocess to %s converter" % converter.name)
+            canonical = converter.postprocess_canonical(canonical, stdout)
+            break
+
     hf_state_dict = dict()
-    for key, tensor in state_dict.items():
-        canon = key.removeprefix(model_prefix)
+    for canon, tensor in canonical.items():
         hf_state_dict[canon if canon.startswith("lm_head.") else "model." + canon] = tensor
 
     shards: List[Tuple[str, Dict[str, torch.Tensor]]] = []
@@ -142,9 +141,7 @@ def dcp2hf(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
 
 
 def launch(cfg: ConvertCheckpointCfg) -> None:
-    """
-    Launch checkpoint conversion.
-    """
+    """Launch checkpoint conversion."""
     with ExitStack() as stack:
         ctx = ConvertCheckpointCtx()
         stack.enter_context(logging_context(cfg, ctx))

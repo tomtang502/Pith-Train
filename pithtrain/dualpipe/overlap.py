@@ -39,9 +39,7 @@ from pithtrain.models.interface import ModelProtocol
 
 
 def _clear_layer_records(layer: IntermediateTensorsLayer) -> None:
-    """
-    Clear tensor references from a layer's records while keeping records pre-allocated.
-    """
+    """Clear tensor references from a layer's records while keeping records pre-allocated."""
     for field in fields(layer):
         record = getattr(layer, field.name)
         for rf in fields(record):
@@ -51,13 +49,14 @@ def _clear_layer_records(layer: IntermediateTensorsLayer) -> None:
 def _copy_layer_records(src: IntermediateTensorsLayer, dst: IntermediateTensorsLayer) -> None:
     """
     Copy record fields from src to dst (pre-allocated).
-    Skip records where args wasn't set (record exists but wasn't used).
+    Skip records that have no populated fields.
     """
     for field in fields(src):
         if not hasattr(src, field.name):
             continue
         src_record = getattr(src, field.name)
-        if not hasattr(src_record, "args"):
+        # Skip if the record has no populated fields at all
+        if not any(hasattr(src_record, rf.name) for rf in fields(src_record)):
             continue
         dst_record = getattr(dst, field.name)
         for rf in fields(src_record):
@@ -96,6 +95,7 @@ def overlapped_forward_backward(
     ctx.bwd_event = torch.cuda.Event()
     ctx.fwd_comm_work = None
     ctx.bwd_comm_work = None
+    ctx.fwd_comm_deferred_free = []
 
     # Module 1 layer L-1 stage 5 backward
     if loss1 is not None:
@@ -106,7 +106,6 @@ def overlapped_forward_backward(
         output_grads1 = [intermediate_tensors1.epilog.args.hidden_states.grad]
         # Clear tensor refs but keep pre-allocated record
         intermediate_tensors1.epilog.args = None
-        intermediate_tensors1.epilog.outs = None
         loss1 = None
     assert output_grads1 is not None
 
@@ -200,9 +199,11 @@ def overlapped_forward_backward(
                 output_splits,
                 ep_group,
             )
-            intermediate_tensors0.layers[layer_idx0].stage4.args = record.args
-            intermediate_tensors0.layers[layer_idx0].stage4.outs = record.outs
             intermediate_tensors0.layers[layer_idx0].stage4.ctx = record.ctx
+            if hasattr(module0_layers[l - 1].mlp, "experts") and ctx.fwd_comm_work is not None:
+                ctx.fwd_comm_deferred_free.append(
+                    intermediate_tensors0.layers[layer_idx0].stage3.outs.moe_outs
+                )  # freed after Stage 5 waits
 
             # Module 1 layer L-l-1 stage 4 backward
             record = intermediate_tensors1.layers[-l - 1].stage4
@@ -288,9 +289,9 @@ def overlapped_forward_backward(
             dedup_input_splits,
             ep_group,
         )
-        intermediate_tensors0.layers[layer_idx0].stage2.args = record.args
-        intermediate_tensors0.layers[layer_idx0].stage2.outs = record.outs
         intermediate_tensors0.layers[layer_idx0].stage2.ctx = record.ctx
+        if hasattr(module0_layers[l].mlp, "experts") and ctx.fwd_comm_work is not None:
+            ctx.fwd_comm_deferred_free.append(sorted_tokens)  # freed after Stage 3 waits
 
         # Module 1 layer L-l-1 stage 2 backward
         record = intermediate_tensors1.layers[-l - 1].stage2
@@ -314,9 +315,11 @@ def overlapped_forward_backward(
     record, moe_outs = stage4_f(
         ctx, module0_layers[num_layers - 1], moe_outs, input_splits, output_splits, ep_group
     )
-    intermediate_tensors0.layers[layer_idx0].stage4.args = record.args
-    intermediate_tensors0.layers[layer_idx0].stage4.outs = record.outs
     intermediate_tensors0.layers[layer_idx0].stage4.ctx = record.ctx
+    if hasattr(module0_layers[num_layers - 1].mlp, "experts") and ctx.fwd_comm_work is not None:
+        ctx.fwd_comm_deferred_free.append(
+            intermediate_tensors0.layers[layer_idx0].stage3.outs.moe_outs
+        )  # freed after Stage 5 waits
 
     # Module 1 layer 0 stage 1 backward
     record = intermediate_tensors1.layers[-num_layers].stage1
@@ -372,7 +375,6 @@ def overlapped_forward_backward(
     if module0.norm is not None:
         record, hidden_states = epilog_f(module0, hidden_states)
         intermediate_tensors0.epilog.args = record.args
-        intermediate_tensors0.epilog.outs = record.outs
 
     # Run criterion if needed
     outputs0 = [hidden_states]

@@ -1,6 +1,4 @@
-"""
-PithTrain training module.
-"""
+"""PithTrain training module."""
 
 import gc
 import math
@@ -22,6 +20,7 @@ from transformers import AutoConfig
 from pithtrain.config import SlottedDefault
 from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
 from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel
+from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_30b_a3b import Qwen3MoeModel
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.load_balance import make_load_balance_loss_fn
@@ -32,44 +31,28 @@ from .distributed import DistributedCtx
 @dataclass(init=False, slots=True)
 class TrainingCfg(SlottedDefault):
     dataset: Path
-    """
-    The root directory hosting the tokenized dataset.
-    """
+    """The root directory hosting the tokenized dataset."""
 
     sequence_length: int
-    """
-    The sequence length for each training sample.
-    """
+    """The sequence length for each training sample."""
 
     seed: int = 1234
-    """
-    The random seed for reproducibility.
-    """
+    """The random seed for reproducibility."""
 
     min_lr: float
-    """
-    The minimum learning rate to start with and decay to.
-    """
+    """The minimum learning rate to start with and decay to."""
 
     max_lr: float
-    """
-    The maximum learning rate.
-    """
+    """The maximum learning rate."""
 
     warmup_steps: int
-    """
-    The number of steps for linear warmup of the learning rate.
-    """
+    """The number of steps for linear warmup of the learning rate."""
 
     max_steps: int
-    """
-    The maximum number of training steps.
-    """
+    """The maximum number of training steps."""
 
     micro_batch_size: int
-    """
-    The size of each micro-batch used during training.
-    """
+    """The size of each micro-batch used during training."""
 
     global_batch_size: int
     """
@@ -79,16 +62,20 @@ class TrainingCfg(SlottedDefault):
     """
 
     optimizer: Literal["Adam"]
-    """
-    The optimizer to use during training.
-    """
+    """The optimizer to use during training."""
 
     scheduler: Literal["CosineAnnealing", "Constant"]
-    """
-    The learning rate scheduler to use after linear warmup.
-    """
+    """The learning rate scheduler to use after linear warmup."""
 
-    model: Union[Path, Literal["deepseek-ai/DeepSeek-V2-Lite", "Qwen/Qwen3-30B-A3B"]]
+    model: Union[
+        Path,
+        Literal[
+            "deepseek-ai/DeepSeek-V2-Lite",
+            "Qwen/Qwen3-30B-A3B",
+            "openai/gpt-oss-20b",
+            "openai/gpt-oss-120b",
+        ],
+    ]
     """
     The model to use for training. Can be a HuggingFace model ID
     (e.g. ``"Qwen/Qwen3-30B-A3B"``) or a local path to a config JSON file
@@ -121,12 +108,12 @@ class TrainingCfg(SlottedDefault):
     """
     Load balance loss strategy for MoE layers.
 
-    * "micro-batch" — Micro-batch loss computed per micro-batch
+    * "micro-batch" - Micro-batch loss computed per micro-batch
       (https://arxiv.org/abs/2101.03961).
-    * "global-batch" — Global-batch loss that synchronises expert selection
+    * "global-batch" - Global-batch loss that synchronises expert selection
       frequencies across DP x EP ranks and accumulates across gradient
       accumulation steps (https://arxiv.org/abs/2501.11873).
-    * "sequence" — Sequence-level loss computed independently per sequence
+    * "sequence" - Sequence-level loss computed independently per sequence
       then averaged over the batch (https://arxiv.org/abs/2405.04434).
     """
 
@@ -158,33 +145,49 @@ class TrainingCfg(SlottedDefault):
     `nsys_stop=N+1`. Set to ``None`` to disable.
     """
 
+    memory_profile_start: Optional[int] = None
+    """
+    Training step at which to start recording CUDA memory allocation history.
+
+    When set, ``torch.cuda.memory._record_memory_history`` is called at the
+    beginning of this step with full stack traces for both allocations and frees.
+    Set to ``None`` to disable.
+    """
+
+    memory_profile_stop: Optional[int] = None
+    """
+    Training step at which to stop recording and dump the memory snapshot.
+
+    At the beginning of this step the recorded history is dumped to
+    ``memory_profile_output`` and recording is disabled. To profile a single
+    step ``N``, set ``memory_profile_start=N`` and ``memory_profile_stop=N+1``.
+    Set to ``None`` to disable.
+    """
+
+    memory_profile_output: Path = Path.cwd()
+    """
+    Output directory for the CUDA memory snapshot. Each rank writes a pickle
+    file named ``snapshot-rank00000.pickle`` etc. into this directory.
+    The snapshot can be visualized at https://pytorch.org/memory_viz.
+    """
+
 
 @dataclass(init=False, slots=True)
 class TrainingCtx:
     dataset: ConcatDataset
-    """
-    The concatenated dataset for training.
-    """
+    """The concatenated dataset for training."""
 
     model: DualPipeV
-    """
-    The model being trained.
-    """
+    """The model being trained."""
 
     optimizer: Optimizer
-    """
-    The optimizer used for training.
-    """
+    """The optimizer used for training."""
 
     scheduler: LRScheduler
-    """
-    The learning rate scheduler used for training.
-    """
+    """The learning rate scheduler used for training."""
 
     step: int
-    """
-    The current training step.
-    """
+    """The current training step."""
 
 
 def setup_dataset(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
@@ -233,13 +236,13 @@ def apply_fsdp(model, mesh: torch.distributed.DeviceMesh):
     other_fsdp_mesh = mesh["dp", "cp", "ep"]._flatten()
     mp = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,
-        reduce_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
         output_dtype=None,
         cast_forward_inputs=True,
     )
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
-        assert isinstance(model[i], (DeepseekV2LiteModel, Qwen3MoeModel))
+        assert isinstance(model[i], (DeepseekV2LiteModel, GptOssModel, Qwen3MoeModel))
         if model[i].embed_tokens is not None:
             fully_shard(
                 model[i].embed_tokens,
@@ -250,15 +253,24 @@ def apply_fsdp(model, mesh: torch.distributed.DeviceMesh):
         if model[i].norm is not None:
             assert model[i].lm_head is not None
             fully_shard(
-                model[i].norm, mesh=other_fsdp_mesh, reshard_after_forward=True, mp_policy=mp
+                model[i].norm,
+                mesh=other_fsdp_mesh,
+                reshard_after_forward=True,
+                mp_policy=mp,
             )
             fully_shard(
-                model[i].lm_head, mesh=other_fsdp_mesh, reshard_after_forward=True, mp_policy=mp
+                model[i].lm_head,
+                mesh=other_fsdp_mesh,
+                reshard_after_forward=True,
+                mp_policy=mp,
             )
         for layer in model[i].layers.values():
             if hasattr(layer.mlp, "experts"):
                 fully_shard(
-                    layer.mlp.experts, mesh=moe_fsdp_mesh, reshard_after_forward=False, mp_policy=mp
+                    layer.mlp.experts,
+                    mesh=moe_fsdp_mesh,
+                    reshard_after_forward=False,
+                    mp_policy=mp,
                 )
             fully_shard(layer, mesh=other_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_attn")
@@ -316,6 +328,9 @@ def setup_model(cfg: TrainingCfg, ctx: TrainingCtx, distributed: DistributedCtx)
     elif module_config.model_type == "qwen3_moe":
         ModelClass = Qwen3MoeModel
         model_kwargs = {"cp_group": cp_group}
+    elif module_config.model_type == "gpt_oss":
+        ModelClass = GptOssModel
+        model_kwargs = {"cp_group": cp_group}
     else:
         raise ValueError(f"Unsupported model_type: {module_config.model_type}")
 
@@ -345,8 +360,8 @@ def setup_model(cfg: TrainingCfg, ctx: TrainingCtx, distributed: DistributedCtx)
         dp_ep_group = device_mesh["dp", "ep"]._flatten().get_group()
         for i in range(2):
             for layer in modules[i].layers.values():
-                if hasattr(layer.mlp, "gate"):
-                    gate = layer.mlp.gate
+                gate = getattr(layer.mlp, "gate", None) or getattr(layer.mlp, "router", None)
+                if gate is not None:
                     loss_fn = make_load_balance_loss_fn(
                         cfg.moe_load_balance_type,
                         cfg.moe_load_balance_coef,
@@ -386,9 +401,7 @@ def setup_scheduler(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
 
 @contextmanager
 def training_context(cfg: object, ctx: object) -> Generator[TrainingCtx, None, None]:
-    """
-    Context manager for training.
-    """
+    """Context manager for training."""
     assert hasattr(cfg, "training") and isinstance(cfg.training, TrainingCfg)
     assert hasattr(ctx, "training") and isinstance(ctx.training, TrainingCtx)
     assert hasattr(ctx, "distributed") and isinstance(ctx.distributed, DistributedCtx)
